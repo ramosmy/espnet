@@ -1,0 +1,127 @@
+[[jasper]]
+filters = 256
+repeat = 5
+kernel = [11]
+stride = [1]
+dilation = [1]
+dropout = 0.2
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 256
+repeat = 5
+kernel = [11]
+stride = [1]
+dilation = [1]
+dropout = 0.2
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 384
+repeat = 5
+kernel = [13]
+stride = [1]
+dilation = [1]
+dropout = 0.2
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 384
+repeat = 5
+kernel = [13]
+stride = [1]
+dilation = [1]
+dropout = 0.2
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 512
+repeat = 5
+kernel = [17]
+stride = [1]
+dilation = [1]
+dropout = 0.2
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 512
+repeat = 5
+kernel = [17]
+stride = [1]
+dilation = [1]
+dropout = 0.2
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 640
+repeat = 5
+kernel = [21]
+stride = [1]
+dilation = [1]
+dropout = 0.3
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 640
+repeat = 5
+kernel = [21]
+stride = [1]
+dilation = [1]
+dropout = 0.3
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 768
+repeat = 5
+kernel = [25]
+stride = [1]
+dilation = [1]
+dropout = 0.3
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 768
+repeat = 5
+kernel = [25]
+stride = [1]
+dilation = [1]
+dropout = 0.3
+residual = true
+residual_dense = true
+
+
+[[jasper]]
+filters = 896
+repeat = 1
+kernel = [29]
+stride = [1]
+dilation = [2]
+dropout = 0.4
+residual = false
+
+[[jasper]]
+filters = 1024
+repeat = 1
+kernel = [1]
+stride = [1]
+dilation = [1]
+dropout = 0.4
+residual = false
