@@ -88,6 +88,7 @@ class Jasper(nn.Module):
     def __init__(self):
         super(Jasper,self).__init__()
         encoder_layers = []
+        # TODO: make feat_in adaptive to init
         feat_in = 256
         cfg = get_model_definition(config_path="./jasper_config.toml")
         for lcfg in cfg["jasper"]:
