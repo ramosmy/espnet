@@ -60,7 +60,7 @@ class Block(nn.Module):
         self.subblock = SubBlock(in_channels=in_channels, out_channels=in_channels,
                                  dropout=dropout, kernel_size=kernel_size)
 
-        # Block内部对最后一层输入进行参差连接前的卷积层用来调整输出的通道数
+        # Block内部对最后一层输入进行残差连接前的卷积层用来调整输出的通道数
         self.last_layer_conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
         self.batch_norm = nn.BatchNorm1d(num_features=in_channels)
         self.activation = nn.ReLU()
