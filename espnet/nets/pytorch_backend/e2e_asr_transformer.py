@@ -365,8 +365,8 @@ class E2E(ASRInterface, torch.nn.Module):
                 for hyp in hyps:
                     hyp['yseq'].append(self.eos)
 
-            # add ended hypothes to a final list, and removed them from current hypothes
-            # (this will be a probmlem, number of hyps < beam)
+            # add ended hypothesis to a final list, and removed them from current hypothesis
+            # (this will be a problem, number of hyps < beam)
             remained_hyps = []
             for hyp in hyps:
                 if hyp['yseq'][-1] == self.eos:
@@ -389,7 +389,7 @@ class E2E(ASRInterface, torch.nn.Module):
 
             hyps = remained_hyps
             if len(hyps) > 0:
-                logging.debug('remeined hypothes: ' + str(len(hyps)))
+                logging.debug('remeined hypothesis: ' + str(len(hyps)))
             else:
                 logging.info('no hypothesis. Finish decoding.')
                 break
@@ -399,7 +399,7 @@ class E2E(ASRInterface, torch.nn.Module):
                     logging.debug(
                         'hypo: ' + ''.join([char_list[int(x)] for x in hyp['yseq'][1:]]))
 
-            logging.debug('number of ended hypothes: ' + str(len(ended_hyps)))
+            logging.debug('number of ended hypothesis: ' + str(len(ended_hyps)))
 
         nbest_hyps = sorted(
             ended_hyps, key=lambda x: x['score'], reverse=True)[:min(len(ended_hyps), recog_args.nbest)]
@@ -407,7 +407,7 @@ class E2E(ASRInterface, torch.nn.Module):
         # check number of hypotheis
         if len(nbest_hyps) == 0:
             logging.warning('there is no N-best results, perform recognition again with smaller minlenratio.')
-            # should copy becasuse Namespace will be overwritten globally
+            # should copy because Namespace will be overwritten globally
             recog_args = Namespace(**vars(recog_args))
             recog_args.minlenratio = max(0.0, recog_args.minlenratio - 0.1)
             return self.recognize(feat, recog_args, char_list, rnnlm)
