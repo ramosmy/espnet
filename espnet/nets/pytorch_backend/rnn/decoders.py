@@ -15,20 +15,17 @@ from espnet.nets.e2e_asr_common import end_detect
 
 from espnet.nets.pytorch_backend.rnn.attentions import att_to_numpy
 
-from espnet.nets.pytorch_backend.nets_utils import append_ids
-from espnet.nets.pytorch_backend.nets_utils import get_last_yseq
-from espnet.nets.pytorch_backend.nets_utils import index_select_list
-from espnet.nets.pytorch_backend.nets_utils import index_select_lm_state
 from espnet.nets.pytorch_backend.nets_utils import mask_by_length
 from espnet.nets.pytorch_backend.nets_utils import pad_list
 from espnet.nets.pytorch_backend.nets_utils import th_accuracy
 from espnet.nets.pytorch_backend.nets_utils import to_device
+from espnet.nets.scorer_interface import ScorerInterface
 
 MAX_DECODER_OUTPUT = 5
 CTC_SCORING_RATIO = 1.5
 
 
-class Decoder(torch.nn.Module):
+class Decoder(torch.nn.Module, ScorerInterface):
     """Decoder module
 
     :param int eprojs: # encoder projection units
@@ -46,12 +43,14 @@ class Decoder(torch.nn.Module):
     :param float sampling_probability: scheduled sampling probability
     :param float dropout: dropout rate
     :param float context_residual: if True, use context vector for token generation
+    :param float replace_sos: use for multilingual (speech/text) translation
     """
 
     def __init__(self, eprojs, odim, dtype, dlayers, dunits, sos, eos, att, verbose=0,
                  char_list=None, labeldist=None, lsm_weight=0., sampling_probability=0.0,
-                 dropout=0.0, context_residual=False):
-        super(Decoder, self).__init__()
+                 dropout=0.0, context_residual=False, replace_sos=False):
+
+        torch.nn.Module.__init__(self)
         self.dtype = dtype
         self.dunits = dunits
         self.dlayers = dlayers
@@ -67,12 +66,12 @@ class Decoder(torch.nn.Module):
         self.dropout_dec += [torch.nn.Dropout(p=dropout)]
         for _ in six.moves.range(1, self.dlayers):
             self.decoder += [
-                torch.nn.LSTMCell(dunits, dunits) if self.dtype == "lstm" else torch.nn.GRUCell(dunits + eprojs,
-                                                                                                dunits)]
+                torch.nn.LSTMCell(dunits, dunits) if self.dtype == "lstm" else torch.nn.GRUCell(dunits, dunits)]
             self.dropout_dec += [torch.nn.Dropout(p=dropout)]
             # NOTE: dropout is applied only for the vertical connections
             # see https://arxiv.org/pdf/1409.2329.pdf
         self.ignore_id = -1
+
         if context_residual:
             self.output = torch.nn.Linear(dunits + eprojs, odim)
         else:
@@ -93,6 +92,9 @@ class Decoder(torch.nn.Module):
         self.sampling_probability = sampling_probability
         self.dropout = dropout
 
+        # for multilingual translation
+        self.replace_sos = replace_sos
+
         self.logzero = -10000000000.0
 
     def zero_state(self, hs_pad):
@@ -110,13 +112,14 @@ class Decoder(torch.nn.Module):
                 z_list[l] = self.decoder[l](self.dropout_dec[l - 1](z_list[l - 1]), z_prev[l])
         return z_list, c_list
 
-    def forward(self, hs_pad, hlens, ys_pad, strm_idx=0):
+    def forward(self, hs_pad, hlens, ys_pad, strm_idx=0, tgt_lang_ids=None):
         """Decoder forward
 
         :param torch.Tensor hs_pad: batch of padded hidden state sequences (B, Tmax, D)
         :param torch.Tensor hlens: batch of lengths of hidden state sequences (B)
         :param torch.Tensor ys_pad: batch of padded character id sequence tensor (B, Lmax)
         :param int strm_idx: stream index indicates the index of decoding stream.
+        :param torch.Tensor tgt_lang_ids: batch of target language id tensor (B, 1)
         :return: attention loss value
         :rtype: torch.Tensor
         :return: accuracy
@@ -135,7 +138,10 @@ class Decoder(torch.nn.Module):
         # prepare input and output word sequences with sos/eos IDs
         eos = ys[0].new([self.eos])
         sos = ys[0].new([self.sos])
-        ys_in = [torch.cat([sos, y], dim=0) for y in ys]
+        if self.replace_sos:
+            ys_in = [torch.cat([idx, y], dim=0) for idx, y in zip(tgt_lang_ids, ys)]
+        else:
+            ys_in = [torch.cat([sos, y], dim=0) for y in ys]
         ys_out = [torch.cat([y, eos], dim=0) for y in ys]
 
         # padding for ys with -1
@@ -169,7 +175,7 @@ class Decoder(torch.nn.Module):
                 logging.info(' scheduled sampling ')
                 z_out = self.output(z_all[-1])
                 z_out = np.argmax(z_out.detach().cpu(), axis=1)
-                z_out = self.dropout_emb(self.embed(z_out.cuda()))
+                z_out = self.dropout_emb(self.embed(to_device(self, z_out)))
                 ey = torch.cat((z_out, att_c), dim=1)  # utt x (zdim + hdim)
             else:
                 ey = torch.cat((eys[:, i, :], att_c), dim=1)  # utt x (zdim + hdim)
@@ -194,6 +200,9 @@ class Decoder(torch.nn.Module):
         acc = th_accuracy(y_all, ys_out_pad, ignore_label=self.ignore_id)
         logging.info('att loss:' + ''.join(str(self.loss.item()).split('\n')))
 
+        # compute perplexity
+        ppl = np.exp(self.loss.item() * np.mean([len(x) for x in ys_in]) / np.sum([len(x) for x in ys_in]))
+
         # show predicted character sequence for debug
         if self.verbose > 0 and self.char_list is not None:
             ys_hat = y_all.view(batch, olength, -1)
@@ -217,7 +226,7 @@ class Decoder(torch.nn.Module):
             loss_reg = - torch.sum((F.log_softmax(y_all, dim=1) * self.vlabeldist).view(-1), dim=0) / len(ys_in)
             self.loss = (1. - self.lsm_weight) * self.loss + self.lsm_weight * loss_reg
 
-        return self.loss, acc
+        return self.loss, acc, ppl
 
     def recognize_beam(self, h, lpz, recog_args, char_list, rnnlm=None, strm_idx=0):
         """beam search implementation
@@ -248,7 +257,12 @@ class Decoder(torch.nn.Module):
         ctc_weight = recog_args.ctc_weight
 
         # preprate sos
-        y = self.sos
+        if self.replace_sos and recog_args.tgt_lang:
+            y = char_list.index(recog_args.tgt_lang)
+        else:
+            y = self.sos
+        logging.info('<sos> index: ' + str(y))
+        logging.info('<sos> mark: ' + char_list[y])
         vy = h.new_zeros(1).long()
 
         if recog_args.maxlenratio == 0:
@@ -404,7 +418,7 @@ class Decoder(torch.nn.Module):
         return nbest_hyps
 
     def recognize_beam_batch(self, h, hlens, lpz, recog_args, char_list, rnnlm=None,
-                             normalize_score=True, strm_idx=0):
+                             normalize_score=True, strm_idx=0, tgt_lang_ids=None):
         logging.info('input lengths: ' + str(h.size(1)))
         att_idx = min(strm_idx, len(self.att) - 1)
         h = mask_by_length(h, hlens, 0.0)
@@ -415,13 +429,10 @@ class Decoder(torch.nn.Module):
         penalty = recog_args.penalty
         ctc_weight = recog_args.ctc_weight
         att_weight = 1.0 - ctc_weight
+        ctc_margin = recog_args.ctc_window_margin
 
         n_bb = batch * beam
-        n_bo = beam * self.odim
-        n_bbo = n_bb * self.odim
-        pad_b = to_device(self, torch.LongTensor([i * beam for i in six.moves.range(batch)]).view(-1, 1))
-        pad_bo = to_device(self, torch.LongTensor([i * n_bo for i in six.moves.range(batch)]).view(-1, 1))
-        pad_o = to_device(self, torch.LongTensor([i * self.odim for i in six.moves.range(n_bb)]).view(-1, 1))
+        pad_b = to_device(self, torch.arange(batch) * beam).view(-1, 1)
 
         max_hlen = int(max(hlens))
         if recog_args.maxlenratio == 0:
@@ -440,11 +451,24 @@ class Decoder(torch.nn.Module):
         vscores = to_device(self, torch.zeros(batch, beam))
 
         a_prev = None
-        rnnlm_prev = None
+        rnnlm_state = None
+        ctc_scorer = None
+        ctc_state = None
 
         self.att[att_idx].reset()  # reset pre-computation of h
 
-        yseq = [[self.sos] for _ in six.moves.range(n_bb)]
+        if self.replace_sos and recog_args.tgt_lang:
+            logging.info('<sos> index: ' + str(char_list.index(recog_args.tgt_lang)))
+            logging.info('<sos> mark: ' + recog_args.tgt_lang)
+            yseq = [[char_list.index(recog_args.tgt_lang)] for _ in six.moves.range(n_bb)]
+        elif tgt_lang_ids is not None:
+            # NOTE: used for evaluation during training
+            yseq = [[tgt_lang_ids[b // recog_args.beam_size]] for b in six.moves.range(n_bb)]
+        else:
+            logging.info('<sos> index: ' + str(self.sos))
+            logging.info('<sos> mark: ' + char_list[self.sos])
+            yseq = [[self.sos] for _ in six.moves.range(n_bb)]
+
         accum_odim_ids = [self.sos for _ in six.moves.range(n_bb)]
         stop_search = [False for _ in six.moves.range(batch)]
         nbest_hyps = [[] for _ in six.moves.range(batch)]
@@ -456,15 +480,14 @@ class Decoder(torch.nn.Module):
         exp_h = exp_h.view(n_bb, h.size()[1], h.size()[2])
 
         if lpz is not None:
-            device_id = torch.cuda.device_of(next(self.parameters()).data).idx
-            ctc_prefix_score = CTCPrefixScoreTH(lpz, 0, self.eos, beam, exp_hlens, device_id)
-            ctc_states_prev = ctc_prefix_score.initial_state()
-            ctc_scores_prev = to_device(self, torch.zeros(batch, n_bo))
+            scoring_ratio = CTC_SCORING_RATIO if att_weight > 0.0 and not lpz.is_cuda else 0
+            ctc_scorer = CTCPrefixScoreTH(lpz, hlens, 0, self.eos, beam,
+                                          scoring_ratio, margin=ctc_margin)
 
         for i in six.moves.range(maxlen):
             logging.debug('position ' + str(i))
 
-            vy = to_device(self, torch.LongTensor(get_last_yseq(yseq)))
+            vy = to_device(self, torch.LongTensor(self._get_last_yseq(yseq)))
             ey = self.dropout_emb(self.embed(vy))
             att_c, att_w = self.att[att_idx](exp_h, exp_hlens, self.dropout_dec[0](z_prev[0]), a_prev)
             ey = torch.cat((ey, att_c), dim=1)
@@ -479,52 +502,33 @@ class Decoder(torch.nn.Module):
 
             # rnnlm
             if rnnlm:
-                rnnlm_state, local_lm_scores = rnnlm.buff_predict(rnnlm_prev, vy, n_bb)
+                rnnlm_state, local_lm_scores = rnnlm.buff_predict(rnnlm_state, vy, n_bb)
                 local_scores = local_scores + recog_args.lm_weight * local_lm_scores
-            local_scores = local_scores.view(batch, n_bo)
 
             # ctc
-            if lpz is not None:
-                ctc_scores, ctc_states = ctc_prefix_score(yseq, ctc_states_prev, accum_odim_ids)
-                ctc_scores = ctc_scores.view(batch, n_bo)
-                local_scores = local_scores + ctc_weight * (ctc_scores - ctc_scores_prev)
-            local_scores = local_scores.view(batch, beam, self.odim)
+            if ctc_scorer:
+                att_w_ = att_w if isinstance(att_w, torch.Tensor) else att_w[0]
+                ctc_state, local_ctc_scores = ctc_scorer(yseq, ctc_state, local_scores, att_w_)
+                local_scores = local_scores + ctc_weight * local_ctc_scores
 
+            local_scores = local_scores.view(batch, beam, self.odim)
             if i == 0:
                 local_scores[:, 1:, :] = self.logzero
-            local_best_scores, local_best_odims = torch.topk(local_scores.view(batch, beam, self.odim),
-                                                             beam, 2)
-            # local pruning (via xp)
-            local_scores = np.full((n_bbo,), self.logzero)
-            _best_odims = local_best_odims.view(n_bb, beam) + pad_o
-            _best_odims = _best_odims.view(-1).cpu().numpy()
-            _best_score = local_best_scores.view(-1).cpu().detach().numpy()
-            local_scores[_best_odims] = _best_score
-            local_scores = to_device(self, torch.from_numpy(local_scores).float()).view(batch, beam, self.odim)
 
-            # (or indexing)
-            # local_scores = to_device(self, torch.full((batch, beam, self.odim), self.logzero))
-            # _best_odims = local_best_odims
-            # _best_score = local_best_scores
-            # for si in six.moves.range(batch):
-            # for bj in six.moves.range(beam):
-            # for bk in six.moves.range(beam):
-            # local_scores[si, bj, _best_odims[si, bj, bk]] = _best_score[si, bj, bk]
-
+            # accumulate scores
             eos_vscores = local_scores[:, :, self.eos] + vscores
             vscores = vscores.view(batch, beam, 1).repeat(1, 1, self.odim)
             vscores[:, :, self.eos] = self.logzero
-            vscores = (vscores + local_scores).view(batch, n_bo)
+            vscores = (vscores + local_scores).view(batch, -1)
 
             # global pruning
             accum_best_scores, accum_best_ids = torch.topk(vscores, beam, 1)
             accum_odim_ids = torch.fmod(accum_best_ids, self.odim).view(-1).data.cpu().tolist()
-            accum_padded_odim_ids = (torch.fmod(accum_best_ids, n_bo) + pad_bo).view(-1).data.cpu().tolist()
             accum_padded_beam_ids = (torch.div(accum_best_ids, self.odim) + pad_b).view(-1).data.cpu().tolist()
 
             y_prev = yseq[:][:]
-            yseq = index_select_list(yseq, accum_padded_beam_ids)
-            yseq = append_ids(yseq, accum_odim_ids)
+            yseq = self._index_select_list(yseq, accum_padded_beam_ids)
+            yseq = self._append_ids(yseq, accum_odim_ids)
             vscores = accum_best_scores
             vidx = to_device(self, torch.LongTensor(accum_padded_beam_ids))
 
@@ -542,18 +546,6 @@ class Decoder(torch.nn.Module):
             z_prev = [torch.index_select(z_list[li].view(n_bb, -1), 0, vidx) for li in range(self.dlayers)]
             c_prev = [torch.index_select(c_list[li].view(n_bb, -1), 0, vidx) for li in range(self.dlayers)]
 
-            if rnnlm:
-                rnnlm_prev = index_select_lm_state(rnnlm_state, 0, vidx)
-            if lpz is not None:
-                ctc_vidx = to_device(self, torch.LongTensor(accum_padded_odim_ids))
-                ctc_scores_prev = torch.index_select(ctc_scores.view(-1), 0, ctc_vidx)
-                ctc_scores_prev = ctc_scores_prev.view(-1, 1).repeat(1, self.odim).view(batch, n_bo)
-
-                ctc_states = torch.transpose(ctc_states, 1, 3).contiguous()
-                ctc_states = ctc_states.view(n_bbo, 2, -1)
-                ctc_states_prev = torch.index_select(ctc_states, 0, ctc_vidx).view(n_bb, 2, -1)
-                ctc_states_prev = torch.transpose(ctc_states_prev, 1, 2)
-
             # pick ended hyps
             if i > minlen:
                 k = 0
@@ -569,8 +561,8 @@ class Decoder(torch.nn.Module):
                             yk.append(self.eos)
                             if len(yk) < hlens[samp_i]:
                                 _vscore = eos_vscores[samp_i][beam_j] + penalty_i
-                                if normalize_score:
-                                    _vscore = _vscore / len(yk)
+                                if rnnlm:
+                                    _vscore += recog_args.lm_weight * rnnlm.final(rnnlm_state, index=k)
                                 _score = _vscore.data.cpu().numpy()
                                 ended_hyps[samp_i].append({'yseq': yk, 'vscore': _vscore, 'score': _score})
                         k = k + 1
@@ -582,28 +574,39 @@ class Decoder(torch.nn.Module):
             if len(stop_search_summary) == 1 and stop_search_summary[0]:
                 break
 
-            torch.cuda.empty_cache()
+            if rnnlm:
+                rnnlm_state = self._index_select_lm_state(rnnlm_state, 0, vidx)
+            if ctc_scorer:
+                ctc_state = ctc_scorer.index_select_state(ctc_state, accum_best_ids)
+
+        torch.cuda.empty_cache()
 
         dummy_hyps = [{'yseq': [self.sos, self.eos], 'score': np.array([-float('inf')])}]
         ended_hyps = [ended_hyps[samp_i] if len(ended_hyps[samp_i]) != 0 else dummy_hyps
                       for samp_i in six.moves.range(batch)]
+        if normalize_score:
+            for samp_i in six.moves.range(batch):
+                for x in ended_hyps[samp_i]:
+                    x['score'] /= len(x['yseq'])
+
         nbest_hyps = [sorted(ended_hyps[samp_i], key=lambda x: x['score'],
                              reverse=True)[:min(len(ended_hyps[samp_i]), recog_args.nbest)]
                       for samp_i in six.moves.range(batch)]
 
         return nbest_hyps
 
-    def calculate_all_attentions(self, hs_pad, hlen, ys_pad, strm_idx=0):
+    def calculate_all_attentions(self, hs_pad, hlen, ys_pad, strm_idx=0, tgt_lang_ids=None):
         """Calculate all of attentions
 
-        :param torch.Tensor hs_pad: batch of padded hidden state sequences (B, Tmax, D)
-        :param torch.Tensor hlen: batch of lengths of hidden state sequences (B)
-        :param torch.Tensor ys_pad: batch of padded character id sequence tensor (B, Lmax)
-        :param int strm_idx: stream index for parallel speaker attention in multi-speaker case
-        :return: attention weights with the following shape,
-            1) multi-head case => attention weights (B, H, Lmax, Tmax),
-            2) other case => attention weights (B, Lmax, Tmax).
-        :rtype: float ndarray
+            :param torch.Tensor hs_pad: batch of padded hidden state sequences (B, Tmax, D)
+            :param torch.Tensor hlen: batch of lengths of hidden state sequences (B)
+            :param torch.Tensor ys_pad: batch of padded character id sequence tensor (B, Lmax)
+            :param int strm_idx: stream index for parallel speaker attention in multi-speaker case
+            :param torch.Tensor tgt_lang_ids: batch of target language id tensor (B, 1)
+            :return: attention weights with the following shape,
+                1) multi-head case => attention weights (B, H, Lmax, Tmax),
+                2) other case => attention weights (B, Lmax, Tmax).
+            :rtype: float ndarray
         """
         # TODO(kan-bayashi): need to make more smart way
         ys = [y[y != self.ignore_id] for y in ys_pad]  # parse padded ys
@@ -616,7 +619,10 @@ class Decoder(torch.nn.Module):
         # prepare input and output word sequences with sos/eos IDs
         eos = ys[0].new([self.eos])
         sos = ys[0].new([self.sos])
-        ys_in = [torch.cat([sos, y], dim=0) for y in ys]
+        if self.replace_sos:
+            ys_in = [torch.cat([idx, y], dim=0) for idx, y in zip(tgt_lang_ids, ys)]
+        else:
+            ys_in = [torch.cat([sos, y], dim=0) for y in ys]
         ys_out = [torch.cat([y, eos], dim=0) for y in ys]
 
         # padding for ys with -1
@@ -651,9 +657,75 @@ class Decoder(torch.nn.Module):
         att_ws = att_to_numpy(att_ws, self.att[att_idx])
         return att_ws
 
+    @staticmethod
+    def _get_last_yseq(exp_yseq):
+        last = []
+        for y_seq in exp_yseq:
+            last.append(y_seq[-1])
+        return last
+
+    @staticmethod
+    def _append_ids(yseq, ids):
+        if isinstance(ids, list):
+            for i, j in enumerate(ids):
+                yseq[i].append(j)
+        else:
+            for i in range(len(yseq)):
+                yseq[i].append(ids)
+        return yseq
+
+    @staticmethod
+    def _index_select_list(yseq, lst):
+        new_yseq = []
+        for l in lst:
+            new_yseq.append(yseq[l][:])
+        return new_yseq
+
+    @staticmethod
+    def _index_select_lm_state(rnnlm_state, dim, vidx):
+        if isinstance(rnnlm_state, dict):
+            new_state = {}
+            for k, v in rnnlm_state.items():
+                new_state[k] = [torch.index_select(vi, dim, vidx) for vi in v]
+        elif isinstance(rnnlm_state, list):
+            new_state = []
+            for i in vidx:
+                new_state.append(rnnlm_state[int(i)][:])
+        return new_state
+
+    # scorer interface methods
+    def init_state(self, x):
+        c_list = [self.zero_state(x.unsqueeze(0))]
+        z_list = [self.zero_state(x.unsqueeze(0))]
+        for _ in six.moves.range(1, self.dlayers):
+            c_list.append(self.zero_state(x.unsqueeze(0)))
+            z_list.append(self.zero_state(x.unsqueeze(0)))
+        # TODO(karita): support strm_index for `asr_mix`
+        strm_index = 0
+        att_idx = min(strm_index, len(self.att) - 1)
+        self.att[att_idx].reset()  # reset pre-computation of h
+        return dict(c_prev=c_list[:], z_prev=z_list[:], a_prev=None, workspace=(att_idx, z_list, c_list))
+
+    def score(self, yseq, state, x):
+        att_idx, z_list, c_list = state["workspace"]
+        vy = yseq[-1].unsqueeze(0)
+        ey = self.dropout_emb(self.embed(vy))  # utt list (1) x zdim
+        att_c, att_w = self.att[att_idx](
+            x.unsqueeze(0), [x.size(0)],
+            self.dropout_dec[0](state['z_prev'][0]), state['a_prev'])
+        ey = torch.cat((ey, att_c), dim=1)  # utt(1) x (zdim + hdim)
+        z_list, c_list = self.rnn_forward(ey, z_list, c_list, state['z_prev'], state['c_prev'])
+        if self.context_residual:
+            logits = self.output(torch.cat((self.dropout_dec[-1](z_list[-1]), att_c), dim=-1))
+        else:
+            logits = self.output(self.dropout_dec[-1](z_list[-1]))
+        logp = F.log_softmax(logits, dim=1).squeeze(0)
+        return logp, dict(c_prev=c_list[:], z_prev=z_list[:], a_prev=att_w, workspace=(att_idx, z_list, c_list))
+
 
 def decoder_for(args, odim, sos, eos, att, labeldist):
     return Decoder(args.eprojs, odim, args.dtype, args.dlayers, args.dunits, sos, eos, att, args.verbose,
                    args.char_list, labeldist,
                    args.lsm_weight, args.sampling_probability, args.dropout_rate_decoder,
-                   args.context_residual)
+                   getattr(args, "context_residual", False),  # use getattr to keep compatibility
+                   getattr(args, "replace_sos", False))  # use getattr to keep compatibility

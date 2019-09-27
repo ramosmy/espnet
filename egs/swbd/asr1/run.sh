@@ -3,8 +3,8 @@
 # Copyright 2017 Johns Hopkins University (Shinji Watanabe)
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
-. ./path.sh
-. ./cmd.sh
+. ./path.sh || exit 1;
+. ./cmd.sh || exit 1;
 
 # general configuration
 backend=pytorch
@@ -20,24 +20,27 @@ resume=        # Resume the training from snapshot
 # feature configuration
 do_delta=false
 
+preprocess_config=conf/specaug.yaml 
 train_config=conf/train.yaml
 decode_config=conf/decode.yaml
 
 # decoding parameter
 recog_model=model.acc.best # set a model to be used for decoding: 'model.acc.best' or 'model.loss.best'
+n_average=10
 
 # data
 swbd1_dir=/export/corpora3/LDC/LDC97S62
 eval2000_dir="/export/corpora2/LDC/LDC2002S09/hub5e_00 /export/corpora2/LDC/LDC2002T43"
 rt03_dir=/export/corpora/LDC/LDC2007S10
 
+# bpemode (unigram or bpe)
+nbpe=2000
+bpemode=bpe
+
 # exp tag
 tag="" # tag for managing experiments.
 
 . utils/parse_options.sh || exit 1;
-
-. ./path.sh
-. ./cmd.sh
 
 # Set bash to 'debug' mode, it will exit on :
 # -e 'error', -u 'undefined variable', -o ... 'error in pipeline', -x 'print commands',
@@ -60,7 +63,7 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     local/rt03_data_prep.sh ${rt03_dir}
     # upsample audio from 8k to 16k to make a recipe consistent with others
     for x in train eval2000 rt03; do
-	sed -i.bak -e "s/$/ sox -R -t wav - -t wav - rate 16000 dither | /" data/${x}/wav.scp
+	    sed -i.bak -e "s/$/ sox -R -t wav - -t wav - rate 16000 dither | /" data/${x}/wav.scp
     done
     # normalize eval2000 ant rt03 texts by
     # 1) convert upper to lower
@@ -79,6 +82,7 @@ fi
 
 feat_tr_dir=${dumpdir}/${train_set}/delta${do_delta}; mkdir -p ${feat_tr_dir}
 feat_dt_dir=${dumpdir}/${train_dev}/delta${do_delta}; mkdir -p ${feat_dt_dir}
+
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     ### Task dependent. You have to design training and dev sets by yourself.
     ### But you can utilize Kaldi recipes in most cases
@@ -122,41 +126,61 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     done
 fi
 
-dict=data/lang_1char/${train_set}_units.txt
-nlsyms=data/lang_1char/non_lang_syms.txt
+dict=data/lang_char/${train_set}_${bpemode}${nbpe}_units.txt
+bpemodel=data/lang_char/${train_set}_${bpemode}${nbpe}
 
 echo "dictionary: ${dict}"
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
     ### Task dependent. You have to check non-linguistic symbols used in the corpus.
     echo "stage 2: Dictionary and Json Data Preparation"
-    mkdir -p data/lang_1char/
+    mkdir -p data/lang_char/
+    echo "<unk> 1" > ${dict} # <unk> must be 1, 0 will be used for "blank" in CTC
 
-    echo "make a non-linguistic symbol list"
-    cut -f 2- data/${train_set}/text | tr " " "\n" | sort | uniq | grep "\[" > ${nlsyms}
-    cat ${nlsyms}
+    # map acronym such as p._h._d. to p h d for train_set& dev_set
+    cp data/${train_set}/text data/${train_set}/text.backup
+    cp data/${train_dev}/text data/${train_dev}/text.backup
+    sed -i 's/\._/ /g; s/\.//g; s/them_1/them/g' data/${train_set}/text
+    sed -i 's/\._/ /g; s/\.//g; s/them_1/them/g' data/${train_dev}/text
 
     echo "make a dictionary"
-    echo "<unk> 1" > ${dict} # <unk> must be 1, 0 will be used for "blank" in CTC
-    text2token.py -s 1 -n 1 -l ${nlsyms} data/${train_set}/text | cut -f 2- -d" " | tr " " "\n" \
-    | sort | uniq | grep -v -e '^\s*$' | awk '{print $0 " " NR+1}' >> ${dict}
+    cut -f 2- -d" " data/${train_set}/text > data/lang_char/input.txt
+
+    # Please make sure sentencepiece is installed
+    spm_train --input=data/lang_char/input.txt \
+            --model_prefix=${bpemodel} \
+            --vocab_size=${nbpe} \
+            --character_coverage=1.0 \
+            --model_type=${bpemode} \
+            --model_prefix=${bpemodel} \
+            --input_sentence_size=100000000 \
+            --bos_id=-1 \
+            --eos_id=-1 \
+            --unk_id=0 \
+            --user_defined_symbols="[laughter],[noise],[vocalized-noise]"
+
+    spm_encode --model=${bpemodel}.model --output_format=piece < data/lang_char/input.txt | tr ' ' '\n' | sort | uniq | awk '{print $0 " " NR+1}' >> ${dict}
     wc -l ${dict}
 
     echo "make json files"
-    data2json.sh --feat ${feat_tr_dir}/feats.scp --nlsyms ${nlsyms} \
-         data/${train_set} ${dict} > ${feat_tr_dir}/data.json
-    data2json.sh --feat ${feat_dt_dir}/feats.scp --nlsyms ${nlsyms} \
-         data/${train_dev} ${dict} > ${feat_dt_dir}/data.json
+    data2json.sh --feat ${feat_tr_dir}/feats.scp --bpecode ${bpemodel}.model \
+        data/${train_set} ${dict} > ${feat_tr_dir}/data_${bpemode}${nbpe}.json
+    data2json.sh --feat ${feat_dt_dir}/feats.scp --bpecode ${bpemodel}.model \
+        data/${train_dev} ${dict} > ${feat_dt_dir}/data_${bpemode}${nbpe}.json
+
     for rtask in ${recog_set}; do
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
-        data2json.sh --feat ${feat_recog_dir}/feats.scp \
-            --nlsyms ${nlsyms} data/${rtask} ${dict} > ${feat_recog_dir}/data.json
+        data2json.sh --feat ${feat_recog_dir}/feats.scp --allow-one-column true \
+            --bpecode ${bpemodel}.model data/${rtask} ${dict} > ${feat_recog_dir}/data_${bpemode}${nbpe}.json
     done
 fi
 
 if [ -z ${tag} ]; then
     expname=${train_set}_${backend}_$(basename ${train_config%.*})
     if ${do_delta}; then
-        expname=${expname}_delta
+	expname=${expname}_delta
+    fi
+    if [ -n "${preprocess_config}" ]; then
+	expname=${expname}_$(basename ${preprocess_config%.*})
     fi
 else
     expname=${train_set}_${backend}_${tag}
@@ -170,6 +194,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     ${cuda_cmd} --gpu ${ngpu} ${expdir}/train.log \
         asr_train.py \
         --config ${train_config} \
+        --preprocess-conf ${preprocess_config} \
         --ngpu ${ngpu} \
         --backend ${backend} \
         --outdir ${expdir}/results \
@@ -180,14 +205,20 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
         --minibatches ${N} \
         --verbose ${verbose} \
         --resume ${resume} \
-        --train-json ${feat_tr_dir}/data.json \
-        --valid-json ${feat_dt_dir}/data.json
+        --train-json ${feat_tr_dir}/data_${bpemode}${nbpe}.json \
+        --valid-json ${feat_dt_dir}/data_${bpemode}${nbpe}.json
 fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     echo "stage 4: Decoding"
     nj=32
-
+    if [[ $(get_yaml.py ${train_config} model-module) = *transformer* ]]; then
+	recog_model=model.last${n_average}.avg.best
+	average_checkpoints.py --backend ${backend} \
+			       --snapshots ${expdir}/results/snapshot.ep.* \
+			       --out ${expdir}/results/${recog_model} \
+			       --num ${n_average}
+    fi
     pids=() # initialize pids
     for rtask in ${recog_set}; do
     (
@@ -195,7 +226,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
 
         # split data
-        splitjson.py --parts ${nj} ${feat_recog_dir}/data.json
+        splitjson.py --parts ${nj} ${feat_recog_dir}/data_${bpemode}${nbpe}.json
 
         #### use CPU for decoding
         ngpu=0
@@ -205,14 +236,17 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
             --config ${decode_config} \
             --ngpu ${ngpu} \
             --backend ${backend} \
-            --recog-json ${feat_recog_dir}/split${nj}utt/data.JOB.json \
+            --recog-json ${feat_recog_dir}/split${nj}utt/data_${bpemode}${nbpe}.JOB.json \
             --result-label ${expdir}/${decode_dir}/data.JOB.json \
             --model ${expdir}/results/${recog_model}
 
-        score_sclite.sh --wer true --nlsyms ${nlsyms} ${expdir}/${decode_dir} ${dict}
-        local/score_sclite.sh data/eval2000 ${expdir}/${decode_dir}
-        local/score_sclite.sh data/rt03 ${expdir}/${decode_dir}
-
+	# this is required for local/score_sclite.sh to get hyp.wrd.trn
+        score_sclite.sh --bpe ${nbpe} --bpemodel ${bpemodel}.model --wer true ${expdir}/${decode_dir} ${dict}
+	if [[ "${decode_dir}" =~ "eval2000" ]]; then
+            local/score_sclite.sh data/eval2000 ${expdir}/${decode_dir}
+	elif [[ "${decode_dir}" =~ "rt03" ]]; then
+	    local/score_sclite.sh data/rt03 ${expdir}/${decode_dir}
+	fi
     ) &
     pids+=($!) # store background pids
     done
@@ -220,3 +254,4 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     [ ${i} -gt 0 ] && echo "$0: ${i} background jobs are failed." && false
     echo "Finished"
 fi
+

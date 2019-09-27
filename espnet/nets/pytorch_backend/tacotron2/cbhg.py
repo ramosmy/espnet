@@ -4,28 +4,64 @@
 # Copyright 2019 Nagoya University (Tomoki Hayashi)
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
+"""CBHG related modules."""
+
 import torch
+import torch.nn.functional as F
 
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.rnn import pad_packed_sequence
 
+from espnet.nets.pytorch_backend.nets_utils import make_non_pad_mask
+
+
+class CBHGLoss(torch.nn.Module):
+    """Loss function module for CBHG."""
+
+    def __init__(self, use_masking=True):
+        """Initialize CBHG loss module.
+
+        Args:
+            use_masking (bool): Whether to mask padded part in loss calculation.
+
+        """
+        super(CBHGLoss, self).__init__()
+        self.use_masking = use_masking
+
+    def forward(self, cbhg_outs, spcs, olens):
+        """Calculate forward propagation.
+
+        Args:
+            cbhg_outs (Tensor): Batch of CBHG outputs (B, Lmax, spc_dim).
+            spcs (Tensor): Batch of groundtruth of spectrogram (B, Lmax, spc_dim).
+            olens (LongTensor): Batch of the lengths of each sequence (B,).
+
+        Returns:
+            Tensor: L1 loss value
+            Tensor: Mean square error loss value.
+
+        """
+        # perform masking for padded values
+        if self.use_masking:
+            mask = make_non_pad_mask(olens).unsqueeze(-1).to(spcs.device)
+            spcs = spcs.masked_select(mask)
+            cbhg_outs = cbhg_outs.masked_select(mask)
+
+        # calculate loss
+        cbhg_l1_loss = F.l1_loss(cbhg_outs, spcs)
+        cbhg_mse_loss = F.mse_loss(cbhg_outs, spcs)
+
+        return cbhg_l1_loss, cbhg_mse_loss
+
 
 class CBHG(torch.nn.Module):
-    """CBHG module to convert log mel-fbank to linear spectrogram
+    """CBHG module to convert log Mel-filterbanks to linear spectrogram.
 
-    Reference:
-        Tacotron: Towards End-to-End Speech Synthesis
-        (https://arxiv.org/abs/1703.10135)
+    This is a module of CBHG introduced in `Tacotron: Towards End-to-End Speech Synthesis`_.
+    The CBHG converts the sequence of log Mel-filterbanks into linear spectrogram.
 
-    :param int idim: dimension of the inputs
-    :param int odim: dimension of the outputs
-    :param int conv_bank_layers: the number of convolution bank layers
-    :param int conv_bank_chans: the number of channels in convolution bank
-    :param int conv_proj_filts: kernel size of convolutional projection layer
-    :param int conv_proj_chans: the number of channels in convolutional projection layer
-    :param int highway_layers: the number of highway network layers
-    :param int highway_units: the number of highway network units
-    :param int gru_units: the number of GRU units (for both directions)
+    .. _`Tacotron: Towards End-to-End Speech Synthesis`: https://arxiv.org/abs/1703.10135
+
     """
 
     def __init__(self,
@@ -38,6 +74,20 @@ class CBHG(torch.nn.Module):
                  highway_layers=4,
                  highway_units=128,
                  gru_units=256):
+        """Initialize CBHG module.
+
+        Args:
+            idim (int): Dimension of the inputs.
+            odim (int): Dimension of the outputs.
+            conv_bank_layers (int, optional): The number of convolution bank layers.
+            conv_bank_chans (int, optional): The number of channels in convolution bank.
+            conv_proj_filts (int, optional): Kernel size of convolutional projection layer.
+            conv_proj_chans (int, optional): The number of channels in convolutional projection layer.
+            highway_layers (int, optional): The number of highway network layers.
+            highway_units (int, optional): The number of highway network units.
+            gru_units (int, optional): The number of GRU units (for both directions).
+
+        """
         super(CBHG, self).__init__()
         self.idim = idim
         self.odim = odim
@@ -95,14 +145,16 @@ class CBHG(torch.nn.Module):
         self.output = torch.nn.Linear(gru_units, odim, bias=True)
 
     def forward(self, xs, ilens):
-        """CBHG module forward
+        """Calculate forward propagation.
 
-        :param torch.Tensor xs: batch of the sequences of inputs (B, Tmax, idim)
-        :param torch.Tensor ilens: list of lengths of each input batch (B)
-        :return: batch of sequences of padded outputs (B, Tmax, eunits)
-        :rtype: torch.Tensor
-        :return: batch of lengths of each encoder states (B)
-        :rtype: list
+        Args:
+            xs (Tensor): Batch of the padded sequences of inputs (B, Tmax, idim).
+            ilens (LongTensor): Batch of lengths of each input sequence (B,).
+
+        Return:
+            Tensor: Batch of the padded sequence of outputs (B, Tmax, odim).
+            LongTensor: Batch of lengths of each output sequence (B,).
+
         """
         xs = xs.transpose(1, 2)  # (B, idim, Tmax)
         convs = []
@@ -135,11 +187,14 @@ class CBHG(torch.nn.Module):
         return xs, ilens
 
     def inference(self, x):
-        """CBHG module inference
+        """Inference.
 
-        :param torch.Tensor x: input (T, idim)
-        :return: the sequence encoder states (T, odim)
-        :rtype: torch.Tensor
+        Args:
+            x (Tensor): The sequences of inputs (T, idim).
+
+        Return:
+            Tensor: The sequence of outputs (T, odim).
+
         """
         assert len(x.size()) == 2
         xs = x.unsqueeze(0)
@@ -157,12 +212,21 @@ class CBHG(torch.nn.Module):
 
 
 class HighwayNet(torch.nn.Module):
-    """Highway Network
+    """Highway Network module.
 
-    :param int idim: dimension of the inputs
+    This is a module of Highway Network introduced in `Highway Networks`_.
+
+    .. _`Highway Networks`: https://arxiv.org/abs/1505.00387
+
     """
 
     def __init__(self, idim):
+        """Initialize Highway Network module.
+
+        Args:
+            idim (int): Dimension of the inputs.
+
+        """
         super(HighwayNet, self).__init__()
         self.idim = idim
         self.projection = torch.nn.Sequential(
@@ -173,11 +237,14 @@ class HighwayNet(torch.nn.Module):
             torch.nn.Sigmoid())
 
     def forward(self, x):
-        """Highway Network forward
+        """Calculate forward propagation.
 
-        :param torch.Tensor x: batch of inputs (B, *, idim)
-        :return: batch of outputs (B, *, idim)
-        :rtype: torch.Tensor
+        Args:
+            x (Tensor): Batch of inputs (B, *, idim).
+
+        Returns:
+            Tensor: Batch of outputs, which are the same shape as inputs (B, *, idim).
+
         """
         proj = self.projection(x)
         gate = self.gate(x)

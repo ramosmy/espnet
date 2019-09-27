@@ -44,10 +44,11 @@ class LoadInputsAndTargets(object):
                  sort_in_input_length=True,
                  use_speaker_embedding=False,
                  use_second_target=False,
-                 preprocess_args=None
+                 preprocess_args=None,
+                 keep_all_data_on_mem=False,
                  ):
         self._loaders = {}
-        if mode not in ['asr', 'tts']:
+        if mode not in ['asr', 'tts', 'mt']:
             raise ValueError(
                 'Only asr or tts are allowed: mode={}'.format(mode))
         if preprocess_conf is not None:
@@ -80,6 +81,8 @@ class LoadInputsAndTargets(object):
             assert isinstance(preprocess_args, dict), type(preprocess_args)
             self.preprocess_args = dict(preprocess_args)
 
+        self.keep_all_data_on_mem = keep_all_data_on_mem
+
     def __call__(self, batch):
         """Function to load inputs and targets from list of dicts
 
@@ -111,7 +114,6 @@ class LoadInputsAndTargets(object):
                         filepath=inp['feat'],
                         filetype=inp.get('filetype', 'mat'))
                     x_feats_dict.setdefault(inp['name'], []).append(x)
-
             # FIXME(kamo): Dirty way to load only speaker_embedding without the other inputs
             elif self.mode == 'tts' and self.use_speaker_embedding:
                 for idx, inp in enumerate(info['input']):
@@ -124,6 +126,11 @@ class LoadInputsAndTargets(object):
                     x_feats_dict.setdefault(inp['name'], []).append(x)
 
             if self.load_output:
+                if self.mode == 'mt':
+                    x = np.fromiter(map(int, info['output'][1]['tokenid'].split()),
+                                    dtype=np.int64)
+                    x_feats_dict.setdefault(info['output'][1]['name'], []).append(x)
+
                 for idx, inp in enumerate(info['output']):
                     if 'tokenid' in inp:
                         # ======= Legacy format for output =======
@@ -145,21 +152,23 @@ class LoadInputsAndTargets(object):
         if self.mode == 'asr':
             return_batch, uttid_list = self._create_batch_asr(
                 x_feats_dict, y_feats_dict, uttid_list)
-
         elif self.mode == 'tts':
             _, info = batch[0]
             eos = int(info['output'][0]['shape'][1]) - 1
             return_batch, uttid_list = self._create_batch_tts(
                 x_feats_dict, y_feats_dict, uttid_list, eos)
+        elif self.mode == 'mt':
+            return_batch, uttid_list = self._create_batch_mt(
+                x_feats_dict, y_feats_dict, uttid_list)
         else:
             raise NotImplementedError
 
         if self.preprocessing is not None:
-            # Apply pre-processing only to input1 feature, now
-            if 'input1' in return_batch:
-                return_batch['input1'] = \
-                    self.preprocessing(return_batch['input1'], uttid_list,
-                                       **self.preprocess_args)
+            # Apply pre-processing all input features
+            for x_name in return_batch.keys():
+                if x_name.startswith("input"):
+                    return_batch[x_name] = self.preprocessing(
+                        return_batch[x_name], uttid_list, **self.preprocess_args)
 
         # Doesn't return the names now.
         return tuple(return_batch.values())
@@ -178,19 +187,19 @@ class LoadInputsAndTargets(object):
         :return: batch, uttid_list
         :rtype: Tuple[OrderedDict, List[str]]
         """
-        # Create a list from the first item
-        xs = list(x_feats_dict.values())[0]
+        # handle single-input and multi-input (paralell) asr mode
+        xs = list(x_feats_dict.values())
 
         if self.load_output:
             if len(y_feats_dict) == 1:
                 ys = list(y_feats_dict.values())[0]
-                assert len(xs) == len(ys), (len(xs), len(ys))
+                assert len(xs[0]) == len(ys), (len(xs[0]), len(ys))
 
                 # get index of non-zero length samples
                 nonzero_idx = list(filter(lambda i: len(ys[i]) > 0, range(len(ys))))
             elif len(y_feats_dict) > 1:  # multi-speaker asr mode
                 ys = list(y_feats_dict.values())
-                assert len(xs) == len(ys[0]), (len(xs), len(ys[0]))
+                assert len(xs[0]) == len(ys[0]), (len(xs[0]), len(ys[0]))
 
                 # get index of non-zero length samples
                 nonzero_idx = list(filter(lambda i: len(ys[0][i]) > 0, range(len(ys[0]))))
@@ -198,7 +207,57 @@ class LoadInputsAndTargets(object):
                     nonzero_idx = filter(lambda i: len(ys[n][i]) > 0, nonzero_idx)
         else:
             # Note(kamo): Be careful not to make nonzero_idx to a generator
-            nonzero_idx = list(range(len(xs)))
+            nonzero_idx = list(range(len(xs[0])))
+
+        if self.sort_in_input_length:
+            # sort in input lengths based on the first input
+            nonzero_sorted_idx = sorted(nonzero_idx, key=lambda i: -len(xs[0][i]))
+        else:
+            nonzero_sorted_idx = nonzero_idx
+
+        if len(nonzero_sorted_idx) != len(xs[0]):
+            logging.warning(
+                'Target sequences include empty tokenid (batch {} -> {}).'
+                .format(len(xs[0]), len(nonzero_sorted_idx)))
+
+        # remove zero-length samples
+        xs = [[x[i] for i in nonzero_sorted_idx] for x in xs]
+        uttid_list = [uttid_list[i] for i in nonzero_sorted_idx]
+
+        x_names = list(x_feats_dict.keys())
+        if self.load_output:
+            if len(y_feats_dict) == 1:
+                ys = [ys[i] for i in nonzero_sorted_idx]
+            elif len(y_feats_dict) > 1:  # multi-speaker asr mode
+                ys = zip(*[[y[i] for i in nonzero_sorted_idx] for y in ys])
+
+            y_name = list(y_feats_dict.keys())[0]
+
+            # Keeping x_name and y_name, e.g. input1, for future extension
+            return_batch = OrderedDict([*[(x_name, x) for x_name, x in zip(x_names, xs)], (y_name, ys)])
+        else:
+            return_batch = OrderedDict([(x_name, x) for x_name, x in zip(x_names, xs)])
+        return return_batch, uttid_list
+
+    def _create_batch_mt(self, x_feats_dict, y_feats_dict, uttid_list):
+        """Create a OrderedDict for the mini-batch
+
+        :param OrderedDict x_feats_dict:
+        :param OrderedDict y_feats_dict:
+        :return: batch, uttid_list
+        :rtype: Tuple[OrderedDict, List[str]]
+        """
+        # Create a list from the first item
+        xs = list(x_feats_dict.values())[0]
+
+        if self.load_output:
+            ys = list(y_feats_dict.values())[0]
+            assert len(xs) == len(ys), (len(xs), len(ys))
+
+            # get index of non-zero length samples
+            nonzero_idx = filter(lambda i: len(ys[i]) > 0, range(len(ys)))
+        else:
+            nonzero_idx = range(len(xs))
 
         if self.sort_in_input_length:
             # sort in input lengths
@@ -217,14 +276,9 @@ class LoadInputsAndTargets(object):
 
         x_name = list(x_feats_dict.keys())[0]
         if self.load_output:
-            if len(y_feats_dict) == 1:
-                ys = [ys[i] for i in nonzero_sorted_idx]
-            elif len(y_feats_dict) > 1:  # multi-speaker asr mode
-                ys = zip(*[[y[i] for i in nonzero_sorted_idx] for y in ys])
-
+            ys = [ys[i] for i in nonzero_sorted_idx]
             y_name = list(y_feats_dict.keys())[0]
 
-            # Keepng x_name and y_name, e.g. input1, for future extension
             return_batch = OrderedDict([(x_name, xs), (y_name, ys)])
         else:
             return_batch = OrderedDict([(x_name, xs)])
@@ -355,8 +409,13 @@ class LoadInputsAndTargets(object):
             #    {"input": [{"feat": "some/path.wav",
             #                "filetype": "sound"},
             # Assume PCM16
-            array, rate = soundfile.read(filepath, dtype='int16')
-            return array
+            if not self.keep_all_data_on_mem:
+                array, _ = soundfile.read(filepath, dtype='int16')
+                return array
+            if filepath not in self._loaders:
+                array, _ = soundfile.read(filepath, dtype='int16')
+                self._loaders[filepath] = array
+            return self._loaders[filepath]
         elif filetype == 'npz':
             # e.g.
             #    {"input": [{"feat": "some/path.npz:F01_050C0101_PED_REAL",
@@ -373,14 +432,22 @@ class LoadInputsAndTargets(object):
             # e.g.
             #    {"input": [{"feat": "some/path.npy",
             #                "filetype": "npy"},
-            return np.load(filepath)
+            if not self.keep_all_data_on_mem:
+                return np.load(filepath)
+            if filepath not in self._loaders:
+                self._loaders[filepath] = np.load(filepath)
+            return self._loaders[filepath]
         elif filetype in ['mat', 'vec']:
             # e.g.
             #    {"input": [{"feat": "some/path.ark:123",
             #                "filetype": "mat"}]},
             # In this case, "123" indicates the starting points of the matrix
             # load_mat can load both matrix and vector
-            return kaldiio.load_mat(filepath)
+            if not self.keep_all_data_on_mem:
+                return kaldiio.load_mat(filepath)
+            if filepath not in self._loaders:
+                self._loaders[filepath] = kaldiio.load_mat(filepath)
+            return self._loaders[filepath]
         elif filetype == 'scp':
             # e.g.
             #    {"input": [{"feat": "some/path.scp:F01_050C0101_PED_REAL",

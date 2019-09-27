@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright 2017 Johns Hopkins University (Shinji Watanabe)
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
@@ -9,6 +9,7 @@ from __future__ import division
 import argparse
 import logging
 import math
+import os
 
 import editdistance
 
@@ -30,6 +31,7 @@ from espnet.nets.pytorch_backend.nets_utils import to_torch_tensor
 from espnet.nets.pytorch_backend.rnn.attentions import att_for
 from espnet.nets.pytorch_backend.rnn.decoders import decoder_for
 from espnet.nets.pytorch_backend.rnn.encoders import encoder_for
+from espnet.nets.scorers.ctc import CTCPrefixScorer
 
 CTC_LOSS_THRESHOLD = 10000
 
@@ -54,14 +56,85 @@ class E2E(ASRInterface, torch.nn.Module):
     :param int idim: dimension of inputs
     :param int odim: dimension of outputs
     :param Namespace args: argument Namespace containing options
+
     """
+    @staticmethod
+    def add_arguments(parser):
+        E2E.encoder_add_arguments(parser)
+        E2E.attention_add_arguments(parser)
+        E2E.decoder_add_arguments(parser)
+        return parser
+
+    @staticmethod
+    def encoder_add_arguments(parser):
+        group = parser.add_argument_group("E2E encoder setting")
+        # encoder
+        group.add_argument('--etype', default='blstmp', type=str,
+                           choices=['lstm', 'blstm', 'lstmp', 'blstmp', 'vgglstmp', 'vggblstmp', 'vgglstm', 'vggblstm',
+                                    'gru', 'bgru', 'grup', 'bgrup', 'vgggrup', 'vggbgrup', 'vgggru', 'vggbgru'],
+                           help='Type of encoder network architecture')
+        group.add_argument('--elayers', default=4, type=int,
+                           help='Number of encoder layers (for shared recognition part in multi-speaker asr mode)')
+        group.add_argument('--eunits', '-u', default=300, type=int,
+                           help='Number of encoder hidden units')
+        group.add_argument('--eprojs', default=320, type=int,
+                           help='Number of encoder projection units')
+        group.add_argument('--subsample', default="1", type=str,
+                           help='Subsample input frames x_y_z means subsample every x frame at 1st layer, '
+                                'every y frame at 2nd layer etc.')
+        return parser
+
+    @staticmethod
+    def attention_add_arguments(parser):
+        group = parser.add_argument_group("E2E attention setting")
+        # attention
+        group.add_argument('--atype', default='dot', type=str,
+                           choices=['noatt', 'dot', 'add', 'location', 'coverage',
+                                    'coverage_location', 'location2d', 'location_recurrent',
+                                    'multi_head_dot', 'multi_head_add', 'multi_head_loc',
+                                    'multi_head_multi_res_loc'],
+                           help='Type of attention architecture')
+        group.add_argument('--adim', default=320, type=int,
+                           help='Number of attention transformation dimensions')
+        group.add_argument('--awin', default=5, type=int,
+                           help='Window size for location2d attention')
+        group.add_argument('--aheads', default=4, type=int,
+                           help='Number of heads for multi head attention')
+        group.add_argument('--aconv-chans', default=-1, type=int,
+                           help='Number of attention convolution channels \
+                           (negative value indicates no location-aware attention)')
+        group.add_argument('--aconv-filts', default=100, type=int,
+                           help='Number of attention convolution filters \
+                           (negative value indicates no location-aware attention)')
+        group.add_argument('--dropout-rate', default=0.0, type=float,
+                           help='Dropout rate for the encoder')
+        return parser
+
+    @staticmethod
+    def decoder_add_arguments(parser):
+        group = parser.add_argument_group("E2E encoder setting")
+        group.add_argument('--dtype', default='lstm', type=str,
+                           choices=['lstm', 'gru'],
+                           help='Type of decoder network architecture')
+        group.add_argument('--dlayers', default=1, type=int,
+                           help='Number of decoder layers')
+        group.add_argument('--dunits', default=320, type=int,
+                           help='Number of decoder hidden units')
+        group.add_argument('--dropout-rate-decoder', default=0.0, type=float,
+                           help='Dropout rate for the decoder')
+        group.add_argument('--sampling-probability', default=0.0, type=float,
+                           help='Ratio of predicted labels fed back to decoder')
+        return parser
 
     def __init__(self, idim, odim, args):
+        super(E2E, self).__init__()
         torch.nn.Module.__init__(self)
         self.mtlalpha = args.mtlalpha
         assert 0.0 <= self.mtlalpha <= 1.0, "mtlalpha should be [0.0, 1.0]"
         self.etype = args.etype
         self.verbose = args.verbose
+        # NOTE: for self.build method
+        args.char_list = getattr(args, "char_list", None)
         self.char_list = args.char_list
         self.outdir = args.outdir
         self.space = args.sym_space
@@ -87,13 +160,16 @@ class E2E(ASRInterface, torch.nn.Module):
         self.subsample = subsample
 
         # label smoothing info
-        if args.lsm_type:
+        if args.lsm_type and os.path.isfile(args.train_json):
             logging.info("Use label smoothing with " + args.lsm_type)
             labeldist = label_smoothing_dist(odim, args.lsm_type, transcript=args.train_json)
         else:
             labeldist = None
 
-        if args.use_frontend:
+        # speech translation related
+        self.replace_sos = getattr(args, "replace_sos", False)  # use getattr to keep compatibility
+
+        if getattr(args, "use_frontend", False):  # use getattr to keep compatibility
             # Relative importing because of using python3 syntax
             from espnet.nets.pytorch_backend.frontends.feature_transform \
                 import feature_transform_for
@@ -124,7 +200,8 @@ class E2E(ASRInterface, torch.nn.Module):
                           'ctc_weight': args.ctc_weight, 'maxlenratio': args.maxlenratio,
                           'minlenratio': args.minlenratio, 'lm_weight': args.lm_weight,
                           'rnnlm': args.rnnlm, 'nbest': args.nbest,
-                          'space': args.sym_space, 'blank': args.sym_blank}
+                          'space': args.sym_space, 'blank': args.sym_blank,
+                          'tgt_lang': False}
 
             self.recog_args = argparse.Namespace(**recog_args)
             self.report_cer = args.report_cer
@@ -190,12 +267,8 @@ class E2E(ASRInterface, torch.nn.Module):
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
         :param torch.Tensor ilens: batch of lengths of input sequences (B)
         :param torch.Tensor ys_pad: batch of padded character id sequence tensor (B, Lmax)
-        :return: ctc loass value
+        :return: loass value
         :rtype: torch.Tensor
-        :return: attention loss value
-        :rtype: torch.Tensor
-        :return: accuracy in attention decoder
-        :rtype: float
         """
         # 0. Frontend
         if self.frontend is not None:
@@ -205,6 +278,12 @@ class E2E(ASRInterface, torch.nn.Module):
             hs_pad, hlens = xs_pad, ilens
 
         # 1. Encoder
+        if self.replace_sos:
+            tgt_lang_ids = ys_pad[:, 0:1]
+            ys_pad = ys_pad[:, 1:]  # remove target language ID in the beggining
+        else:
+            tgt_lang_ids = None
+
         hs_pad, hlens, _ = self.enc(hs_pad, hlens)
 
         # 2. CTC loss
@@ -217,11 +296,11 @@ class E2E(ASRInterface, torch.nn.Module):
         if self.mtlalpha == 1:
             self.loss_att, acc = None, None
         else:
-            self.loss_att, acc = self.dec(hs_pad, hlens, ys_pad)
+            self.loss_att, acc, _ = self.dec(hs_pad, hlens, ys_pad, tgt_lang_ids=tgt_lang_ids)
         self.acc = acc
 
         # 4. compute cer without beam search
-        if self.mtlalpha == 0:
+        if self.mtlalpha == 0 or self.char_list is None:
             cer_ctc = None
         else:
             cers = []
@@ -255,9 +334,11 @@ class E2E(ASRInterface, torch.nn.Module):
                 lpz = None
 
             word_eds, word_ref_lens, char_eds, char_ref_lens = [], [], [], []
-            nbest_hyps = self.dec.recognize_beam_batch(hs_pad, torch.tensor(hlens), lpz,
-                                                       self.recog_args, self.char_list,
-                                                       self.rnnlm)
+            nbest_hyps = self.dec.recognize_beam_batch(
+                hs_pad, torch.tensor(hlens), lpz,
+                self.recog_args, self.char_list,
+                self.rnnlm,
+                tgt_lang_ids=tgt_lang_ids.squeeze(1).tolist() if self.replace_sos else None)
             # remove <sos> and <eos>
             y_hats = [nbest_hyp[0]['yseq'][1:-1] for nbest_hyp in nbest_hyps]
             for i, y_hat in enumerate(y_hats):
@@ -302,23 +383,17 @@ class E2E(ASRInterface, torch.nn.Module):
             logging.warning('loss (=%f) is not correct', loss_data)
         return self.loss
 
-    def recognize(self, x, recog_args, char_list, rnnlm=None):
-        """E2E beam search
+    def scorers(self):
+        return dict(decoder=self.dec, ctc=CTCPrefixScorer(self.ctc, self.eos))
 
-        :param ndarray x: input acoustic feature (T, D)
-        :param Namespace recog_args: argument Namespace containing options
-        :param list char_list: list of characters
-        :param torch.nn.Module rnnlm: language model module
-        :return: N-best decoding results
-        :rtype: list
-        """
-        prev = self.training
+    def encode(self, x):
         self.eval()
         ilens = [x.shape[0]]
 
         # subsample frame
         x = x[::self.subsample[0], :]
-        h = to_device(self, to_torch_tensor(x).float())
+        p = next(self.parameters())
+        h = torch.as_tensor(x, device=p.device, dtype=p.dtype)
         # make a utt list (1) to use the same interface for encoder
         hs = h.contiguous().unsqueeze(0)
 
@@ -331,7 +406,19 @@ class E2E(ASRInterface, torch.nn.Module):
 
         # 1. encoder
         hs, _, _ = self.enc(hs, hlens)
+        return hs.squeeze(0)
 
+    def recognize(self, x, recog_args, char_list, rnnlm=None):
+        """E2E beam search
+
+        :param ndarray x: input acoustic feature (T, D)
+        :param Namespace recog_args: argument Namespace containing options
+        :param list char_list: list of characters
+        :param torch.nn.Module rnnlm: language model module
+        :return: N-best decoding results
+        :rtype: list
+        """
+        hs = self.encode(x).unsqueeze(0)
         # calculate log P(z_t|X) for CTC scores
         if recog_args.ctc_weight > 0.0:
             lpz = self.ctc.log_softmax(hs)[0]
@@ -341,10 +428,6 @@ class E2E(ASRInterface, torch.nn.Module):
         # 2. Decoder
         # decode the first utterance
         y = self.dec.recognize_beam(hs[0], lpz, recog_args, char_list, rnnlm)
-
-        if prev:
-            self.train()
-
         return y
 
     def recognize_batch(self, xs, recog_args, char_list, rnnlm=None):
@@ -373,18 +456,21 @@ class E2E(ASRInterface, torch.nn.Module):
         else:
             hs_pad, hlens = xs_pad, ilens
 
-        # 1. encoder
+        # 1. Encoder
         hs_pad, hlens, _ = self.enc(hs_pad, hlens)
 
         # calculate log P(z_t|X) for CTC scores
         if recog_args.ctc_weight > 0.0:
             lpz = self.ctc.log_softmax(hs_pad)
+            normalize_score = False
         else:
             lpz = None
+            normalize_score = True
 
-        # 2. decoder
+        # 2. Decoder
         hlens = torch.tensor(list(map(int, hlens)))  # make sure hlens is tensor
-        y = self.dec.recognize_beam_batch(hs_pad, hlens, lpz, recog_args, char_list, rnnlm)
+        y = self.dec.recognize_beam_batch(hs_pad, hlens, lpz, recog_args, char_list,
+                                          rnnlm, normalize_score=normalize_score)
 
         if prev:
             self.train()
@@ -431,10 +517,15 @@ class E2E(ASRInterface, torch.nn.Module):
                 hs_pad, hlens = xs_pad, ilens
 
             # 1. Encoder
+            if self.replace_sos:
+                tgt_lang_ids = ys_pad[:, 0:1]
+                ys_pad = ys_pad[:, 1:]  # remove target language ID in the beggining
+            else:
+                tgt_lang_ids = None
             hpad, hlens, _ = self.enc(hs_pad, hlens)
 
             # 2. Decoder
-            att_ws = self.dec.calculate_all_attentions(hpad, hlens, ys_pad)
+            att_ws = self.dec.calculate_all_attentions(hpad, hlens, ys_pad, tgt_lang_ids=tgt_lang_ids)
 
         return att_ws
 
