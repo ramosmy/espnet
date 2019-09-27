@@ -25,11 +25,11 @@ def get_model_definition(config_path):
 
 
 class SubBlock(nn.Module):
-    def __init__(self, dropout, in_channels, out_channels, kernel_size, **kwargs):
+    def __init__(self, dropout, padding, in_channels, out_channels, kernel_size, stride=1,dilation=1):
         super(SubBlock, self).__init__()
-        padding = get_same_padding(kernel_size[0])
+        # padding = get_same_padding(kernel_size[0])
         self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                              stride=1, padding=padding)
+                              padding=padding, stride=stride, dilation=dilation)
         # self.conv = nn.Conv1d(in_channels=256, out_channels=256,
         #                       kernel_size=11, stride=1, padding=5)
         self.batch_norm = nn.BatchNorm1d(num_features=in_channels)
@@ -43,51 +43,60 @@ class SubBlock(nn.Module):
         T: Time (or Sequence length)
     """
     def forward(self, x):
-        print(x.shape)
+        # print(x.shape)
         x = self.conv(x)
         x = self.batch_norm(x)
         x = self.activation(x)
-        print(x.shape)
+        # print(x.shape)
         return self.dropout(x)
 
 
 class Block(nn.Module):
-    def __init__(self, repeat, dropout, in_channels, out_channels, kernel_size):
+    def __init__(self, repeat, dropout, in_channels, out_channels, kernel_size, stride=1, dilation=1):
         super(Block, self).__init__()
         self.repeat = repeat
+        self.padding = get_same_padding(kernel_size[0])
+
 
         # Block内部channel数相同，都等于in_channels
-        self.subblock = SubBlock(in_channels=in_channels, out_channels=in_channels,
-                                 dropout=dropout, kernel_size=kernel_size)
+        self.subblock = SubBlock(in_channels=in_channels, out_channels=in_channels, dropout=dropout,
+                                 padding=self.padding,kernel_size=kernel_size, stride=stride, dilation=dilation)
 
-        # Block内部对最后一层输入进行参差连接前的卷积层用来调整输出的通道数
+        # Block内部对最后一层输入进行残差连接前的卷积层用来调整输出的通道数
         self.last_layer_conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
-        self.batch_norm = nn.BatchNorm1d(num_features=in_channels)
+        self.batch_norm = nn.BatchNorm1d(num_features=out_channels)
         self.activation = nn.ReLU()
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
         last_input_list = []
-        for _ in range(self.repeat-1):
-
-            # prepare input for the last sub-layer
-            last_input = self.last_layer_conv(x)
-            last_input = self.batch_norm(last_input)
-            last_input_list.append(last_input)
-
+        print(self.repeat)
+        for _ in range(self.repeat):
+            print(_)
+            last_input_list.append(x)
             # connnet inner sub-blocks
             x = self.subblock(x)
 
-        last_input = torch.Tensor(sum(last_input_list))
-        last_input = self.activation(last_input)
-        last_input = self.dropout(last_input)
-        return last_input
+        # prepare input for the last sub-layer
+        out_list = []
+        for last_input in last_input_list:
+            last_input = self.last_layer_conv(x)
+            last_input = self.batch_norm(last_input)
+            print(last_input.shape)
+            out_list.append(last_input)
+
+
+        output = torch.Tensor(sum(out_list))
+        output = self.activation(output)
+        output = self.dropout(output)
+        return output
 
 
 class Jasper(nn.Module):
     def __init__(self):
         super(Jasper,self).__init__()
         encoder_layers = []
+        # TODO: make feat_in adaptive to init
         feat_in = 256
         cfg = get_model_definition(config_path="./jasper_config.toml")
         for lcfg in cfg["jasper"]:
@@ -95,7 +104,9 @@ class Jasper(nn.Module):
                           out_channels=lcfg['filters'],
                           repeat=lcfg['repeat'],
                           kernel_size=lcfg['kernel'],
-                          dropout=lcfg['dropout'],)
+                          dropout=lcfg['dropout'],
+                          stride=lcfg['stride'],
+                          dilation=lcfg['dilation'])
             feat_in = lcfg['filters']
             encoder_layers.append(block)
         self.encoder = nn.Sequential(*encoder_layers)
@@ -107,12 +118,12 @@ class Jasper(nn.Module):
 
 if __name__=='__main__':
     model = Jasper()
-    B = 16
+    B = 1
     F = 256  # should adapt to the config file
     T = 16000
     input = torch.Tensor(torch.randn(B, F, T))
-    for param in model.named_parameters():
-        print(param[1].shape, param[0])
-    print(input.shape)
+    # for param in model.named_parameters():
+    #     print(param[1].shape, param[0])
+    # print(input.shape)
     output = model(input)
-    print(output.shape)
+    # print(output.shape)
